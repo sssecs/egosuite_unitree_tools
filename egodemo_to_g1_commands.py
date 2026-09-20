@@ -7,12 +7,19 @@ from pathlib import Path
 import json
 import numpy as np
 
+from cross_embodiment_style_descriptor import (
+    STYLE_DESCRIPTOR_VERSION,
+    export_style_descriptor,
+    extract_human_style_descriptor,
+)
+from dataset_filter import SittingFilterConfig, assess_sitting_episode
 from egosuite_to_g1_command import (
     G1_HEIGHT_M,
     G1_WRIST_SPAN_M,
-    convert_episode,
+    extract_g1_command,
     export_g1_command,
     find_episode_roots,
+    load_episode,
     write_control_interface_yaml,
 )
 
@@ -62,13 +69,16 @@ def output_path(root, ep, out_dir):
     return out_dir / rel.parent / f"{rel.name}.npz"
 
 
+def style_output_path(command_path):
+    command_path = Path(command_path)
+    return command_path.with_name(f"{command_path.stem}.style.npz")
+
 
 def existing_interface_version(path):
     """Return exported interface version, or None if unreadable/legacy."""
     path = Path(path)
     if not path.exists():
         return None
-
     try:
         with np.load(path, allow_pickle=False) as f:
             if "metadata_json" not in f.files:
@@ -82,6 +92,29 @@ def existing_interface_version(path):
         return None
 
 
+def existing_style_descriptor_version(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as f:
+            raw = f["metadata_json"]
+            if raw.ndim == 0:
+                raw = raw.item()
+            metadata = json.loads(str(raw))
+            return str(metadata.get("descriptor_version", ""))
+    except Exception:
+        return None
+
+
+def write_filter_report(path, records):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def main():
     p = argparse.ArgumentParser(
         description=(
@@ -92,7 +125,10 @@ def main():
     p.add_argument(
         "--root",
         type=Path,
-        default=Path("./EgoDemo/EgoStand-body/lerobot"),
+        default=Path(
+            "/mnt/hdd/humanoid_locomotion/datasets/data/"
+            "EgoDemo/EgoStand-body/lerobot"
+        ),
     )
 
     sel = p.add_mutually_exclusive_group()
@@ -142,9 +178,38 @@ def main():
         choices=["auto", "feet_locked"],
         default="auto",
     )
+    p.add_argument(
+        "--sitting-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reject episodes dominated by persistent seated geometry (default: on)",
+    )
+    p.add_argument(
+        "--sitting-reject-fraction",
+        type=float,
+        default=0.60,
+        help="minimum persistent seated-frame fraction for episode rejection",
+    )
+    p.add_argument(
+        "--filter-report",
+        type=Path,
+        default=None,
+        help="JSONL audit report (default: OUTPUT_DIR/filter_report.jsonl)",
+    )
+    p.add_argument(
+        "--style-descriptor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write independent *.style.npz descriptor sidecars (default: on)",
+    )
+    p.add_argument("--style-smoothing-window", type=int, default=5)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
+    if not 0.0 <= args.sitting_reject_fraction <= 1.0:
+        p.error("--sitting-reject-fraction must be in [0, 1]")
+    if args.style_smoothing_window < 1:
+        p.error("--style-smoothing-window must be positive")
 
     root = args.root.expanduser().resolve()
     episodes = find_episode_roots(root)
@@ -166,28 +231,77 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     write_control_interface_yaml(out_dir / "g1_whole_body_command.yaml")
 
-    converted = skipped = failed = 0
+    converted = skipped = filtered = described = failed = 0
+    filter_records = []
+    filter_config = SittingFilterConfig(
+        reject_fraction=args.sitting_reject_fraction,
+    )
 
     for i, ep in enumerate(selected, 1):
         out_path = output_path(root, ep, out_dir)
+        descriptor_path = style_output_path(out_path)
         print(f"[{i}/{len(selected)}] {label(root, ep)}")
 
-        if out_path.exists() and not args.overwrite:
-            old_version = existing_interface_version(out_path)
-
-            if old_version == "3.2":
-                print(f"  skip: existing compatible v3.2 file: {out_path}")
-                skipped += 1
+        try:
+            data = load_episode(ep)
+            assessment = assess_sitting_episode(
+                data["body"],
+                data["timestamps"],
+                fps=data["fps"],
+                config=filter_config,
+            )
+            record = {
+                "episode": label(root, ep),
+                **{k: v for k, v in assessment.items() if not k.endswith("_mask")},
+            }
+            filter_records.append(record)
+            if args.sitting_filter and assessment["reject"]:
+                filtered += 1
+                print(
+                    "  filter: persistent seated pose "
+                    f"({assessment['seated_fraction']:.1%} of frames)"
+                )
                 continue
 
-            print(
-                f"  stale/incompatible output detected "
-                f"(version={old_version!r}); regenerating: {out_path}"
-            )
+            if args.style_descriptor:
+                style_version = existing_style_descriptor_version(descriptor_path)
+                if (
+                    descriptor_path.exists()
+                    and not args.overwrite
+                    and style_version == STYLE_DESCRIPTOR_VERSION
+                ):
+                    print(f"  style: existing file kept: {descriptor_path}")
+                else:
+                    if descriptor_path.exists() and not args.overwrite:
+                        print(
+                            "  stale/incompatible style descriptor "
+                            f"(version={style_version!r}); regenerating"
+                        )
+                    style = extract_human_style_descriptor(
+                        data["body"],
+                        data["timestamps"],
+                        smoothing_window=args.style_smoothing_window,
+                    )
+                    export_style_descriptor(descriptor_path, style, ep)
+                    described += 1
+                    print(
+                        f"  style descriptor : {style['descriptor'].shape} -> "
+                        f"{descriptor_path}"
+                    )
 
-        try:
-            _, cmd = convert_episode(
-                ep,
+            old_version = existing_interface_version(out_path)
+            if out_path.exists() and not args.overwrite and old_version == "3.2":
+                print(f"  command: existing compatible v3.2 file kept: {out_path}")
+                skipped += 1
+                continue
+            if out_path.exists() and not args.overwrite:
+                print(
+                    f"  stale/incompatible command (version={old_version!r}); "
+                    f"regenerating: {out_path}"
+                )
+
+            cmd = extract_g1_command(
+                data,
                 scale_mode=args.scale_mode,
                 robot_height=args.robot_height,
                 robot_wrist_span=args.robot_wrist_span,
@@ -226,8 +340,12 @@ def main():
                 raise
 
     print(
-        f"\nconverted={converted} skipped={skipped} failed={failed}"
+        f"\nconverted={converted} described={described} filtered={filtered} "
+        f"skipped={skipped} failed={failed}"
     )
+    report_path = args.filter_report or (out_dir / "filter_report.jsonl")
+    write_filter_report(report_path, filter_records)
+    print(f"filter_report={report_path}")
 
 
 if __name__ == "__main__":

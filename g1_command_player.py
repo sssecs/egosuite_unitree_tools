@@ -18,6 +18,7 @@ Keyboard:
 Useful diagnostics:
     --start-frame 15
     --no-human
+    --style path/to/episode.style.npz
     --debug
 
 If rendering fails at a particular frame, the full traceback and frame index
@@ -34,6 +35,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from cross_embodiment_style_descriptor import (
+    STYLE_DESCRIPTOR_NAMES,
+    STYLE_DESCRIPTOR_VERSION,
+)
 from egosuite_to_g1_command import (
     LEFT_WRIST,
     RIGHT_WRIST,
@@ -62,6 +67,31 @@ REQUIRED_KEYS = [
     "torso_heading_world",
     "ground_z_world",
 ]
+
+STYLE_REQUIRED_KEYS = [
+    "style_descriptor",
+    "style_descriptor_names",
+]
+
+STYLE_SHORT_NAMES = {
+    "pelvis_height_neutral_norm": "pelvis height/neutral",
+    "effective_leg_length_left": "leg extension L",
+    "effective_leg_length_right": "leg extension R",
+    "knee_ground_distance_left": "knee-ground L",
+    "knee_ground_distance_right": "knee-ground R",
+    "torso_pitch": "torso pitch",
+    "shoulder_mid_rel_pelvis_forward": "shoulder-pelvis/fwd",
+    "shoulder_mid_rel_pelvis_left": "shoulder-pelvis/left",
+    "shoulder_pelvis_yaw_difference": "shoulder-pelvis yaw",
+    "left_foot_rel_pelvis_forward": "foot L rel/fwd",
+    "left_foot_rel_pelvis_left": "foot L rel/left",
+    "right_foot_rel_pelvis_forward": "foot R rel/fwd",
+    "right_foot_rel_pelvis_left": "foot R rel/left",
+    "foot_pseudo_contact_left": "foot contact L",
+    "foot_pseudo_contact_right": "foot contact R",
+    "knee_pseudo_contact_left": "knee contact L",
+    "knee_pseudo_contact_right": "knee contact R",
+}
 
 
 def load_command(path):
@@ -125,6 +155,64 @@ def load_command(path):
             )
 
     return path, cmd, metadata
+
+
+def load_style_descriptor(path, fallback_timestamps=None):
+    path = Path(path).expanduser().resolve()
+    with np.load(path, allow_pickle=False) as f:
+        missing = [key for key in STYLE_REQUIRED_KEYS if key not in f.files]
+        if missing:
+            raise RuntimeError(
+                "Missing required style NPZ keys:\n  " + "\n  ".join(missing)
+            )
+        descriptor = np.asarray(f["style_descriptor"], dtype=np.float64)
+        names = tuple(str(value) for value in np.asarray(f["style_descriptor_names"]))
+        if "timestamp" in f.files:
+            timestamps = np.asarray(f["timestamp"], dtype=np.float64)
+        elif fallback_timestamps is not None and len(fallback_timestamps) == len(descriptor):
+            timestamps = np.asarray(fallback_timestamps, dtype=np.float64)
+        else:
+            timestamps = np.arange(len(descriptor), dtype=np.float64)
+        valid_mask = (
+            np.asarray(f["style_valid_mask"], dtype=bool)
+            if "style_valid_mask" in f.files else np.all(np.isfinite(descriptor), axis=1)
+        )
+        metadata = {}
+        if "metadata_json" in f.files:
+            raw = f["metadata_json"]
+            if raw.ndim == 0:
+                raw = raw.item()
+            try:
+                metadata = json.loads(str(raw))
+            except Exception:
+                metadata = {}
+
+    if descriptor.ndim != 2 or descriptor.shape[1] != len(names):
+        raise RuntimeError(
+            f"Style descriptor shape {descriptor.shape} is incompatible with "
+            f"{len(names)} names."
+        )
+    if len(descriptor) == 0 or timestamps.shape != (len(descriptor),):
+        raise RuntimeError("Style descriptor has invalid or empty timestamps.")
+    if valid_mask.shape != (len(descriptor),):
+        raise RuntimeError("style_valid_mask must contain one value per frame.")
+    if len(set(names)) != len(names):
+        raise RuntimeError("Style descriptor names must be unique.")
+    if names != STYLE_DESCRIPTOR_NAMES:
+        version = metadata.get("descriptor_version", "unknown")
+        raise RuntimeError(
+            f"Unsupported style schema v{version} with {len(names)} dimensions; "
+            f"expected v{STYLE_DESCRIPTOR_VERSION} with "
+            f"{len(STYLE_DESCRIPTOR_NAMES)} dimensions. Regenerate this sidecar "
+            "with egodemo_to_g1_commands.py."
+        )
+    return path, {
+        "descriptor": descriptor,
+        "names": names,
+        "timestamp": timestamps,
+        "valid_mask": valid_mask,
+        "metadata": metadata,
+    }
 
 
 def quat_to_matrix(q):
@@ -285,6 +373,8 @@ class CommandPlayer:
         human_body=None,
         human_indices=None,
         verification=None,
+        style=None,
+        style_indices=None,
         fps=None,
         start_frame=0,
         trail_frames=45,
@@ -297,6 +387,14 @@ class CommandPlayer:
         self.human_body = human_body
         self.human_indices = human_indices
         self.verification = verification
+        self.style = style
+        self.style_indices = (
+            np.asarray(style_indices, dtype=np.int64)
+            if style_indices is not None else (
+                nearest_indices(style["timestamp"], cmd["timestamp"])
+                if style is not None else None
+            )
+        )
 
         self.n = len(
             cmd["timestamp"]
@@ -340,13 +438,30 @@ class CommandPlayer:
         else:
             self.base_fps = 30.0
 
-        self.fig = plt.figure(
-            figsize=(11, 8),
-        )
-        self.ax = self.fig.add_subplot(
-            111,
-            projection="3d",
-        )
+        if self.style is None:
+            self.fig = plt.figure(figsize=(11, 8))
+            self.ax = self.fig.add_subplot(111, projection="3d")
+            self.style_axes = []
+            self.style_value_ax = None
+            self.style_cursors = []
+            self.style_value_text = None
+        else:
+            self.fig = plt.figure(figsize=(18, 10))
+            grid = self.fig.add_gridspec(
+                3,
+                3,
+                width_ratios=(1.75, 1.10, 0.95),
+                hspace=0.34,
+                wspace=0.28,
+            )
+            self.ax = self.fig.add_subplot(grid[:, 0], projection="3d")
+            self.style_axes = [
+                self.fig.add_subplot(grid[0, 1]),
+                self.fig.add_subplot(grid[1, 1]),
+                self.fig.add_subplot(grid[2, 1]),
+            ]
+            self.style_value_ax = self.fig.add_subplot(grid[:, 2])
+            self.setup_style_display()
 
         self.fig.canvas.mpl_connect(
             "key_press_event",
@@ -380,6 +495,107 @@ class CommandPlayer:
             )
 
         self.render_frame()
+
+    def style_column(self, name):
+        try:
+            index = self.style["names"].index(name)
+        except ValueError:
+            return None
+        return self.style["descriptor"][:, index]
+
+    def setup_style_display(self):
+        """Create persistent descriptor traces; only cursors/text change per frame."""
+        timestamps = self.style["timestamp"]
+        groups = [
+            (
+                "Posture",
+                [
+                    ("pelvis_height_neutral_norm", "pelvis/neutral"),
+                    ("effective_leg_length_left", "leg ext L"),
+                    ("effective_leg_length_right", "leg ext R"),
+                    ("knee_ground_distance_left", "knee-ground L"),
+                    ("knee_ground_distance_right", "knee-ground R"),
+                    ("torso_pitch", "torso pitch"),
+                ],
+            ),
+            (
+                "Heading-local relative placement",
+                [
+                    ("shoulder_mid_rel_pelvis_forward", "shoulder/fwd"),
+                    ("shoulder_mid_rel_pelvis_left", "shoulder/left"),
+                    ("shoulder_pelvis_yaw_difference", "yaw difference"),
+                    ("left_foot_rel_pelvis_forward", "foot L/fwd"),
+                    ("left_foot_rel_pelvis_left", "foot L/left"),
+                    ("right_foot_rel_pelvis_forward", "foot R/fwd"),
+                    ("right_foot_rel_pelvis_left", "foot R/left"),
+                ],
+            ),
+            (
+                "Foot / knee pseudo-contact",
+                [
+                    ("foot_pseudo_contact_left", "foot L"),
+                    ("foot_pseudo_contact_right", "foot R"),
+                    ("knee_pseudo_contact_left", "knee L"),
+                    ("knee_pseudo_contact_right", "knee R"),
+                ],
+            ),
+        ]
+        self.style_cursors = []
+        for axis, (title, signals) in zip(self.style_axes, groups):
+            for name, label in signals:
+                values = self.style_column(name)
+                if values is not None:
+                    axis.plot(timestamps, values, linewidth=1.15, label=label)
+            axis.axhline(0.0, color="black", linewidth=0.6, alpha=0.25)
+            cursor = axis.axvline(timestamps[0], color="black", linewidth=1.5)
+            self.style_cursors.append(cursor)
+            axis.set_title(title, fontsize=10)
+            axis.set_xlabel("time [s]")
+            axis.grid(alpha=0.20)
+            axis.legend(loc="upper right", fontsize=7, ncol=2)
+
+        self.style_value_ax.set_axis_off()
+        self.style_value_ax.set_title(
+            f"Current {len(self.style['names'])}-D descriptor", fontsize=11
+        )
+        self.style_value_text = self.style_value_ax.text(
+            0.0,
+            0.98,
+            "",
+            transform=self.style_value_ax.transAxes,
+            va="top",
+            family="monospace",
+            fontsize=8.3,
+        )
+
+    def update_style_display(self, command_index):
+        if self.style is None:
+            return
+        style_index = int(self.style_indices[command_index])
+        time = float(self.style["timestamp"][style_index])
+        for cursor in self.style_cursors:
+            cursor.set_xdata([time, time])
+
+        values = self.style["descriptor"][style_index]
+        valid = bool(self.style["valid_mask"][style_index])
+        section_starts = {
+            0: "POSTURE",
+            6: "RELATIVE GEOMETRY",
+            13: "PSEUDO-CONTACT",
+        }
+        lines = [
+            f"style frame {style_index + 1}/{len(self.style['descriptor'])}",
+            f"t={time:.3f}s  valid={valid}",
+            "",
+        ]
+        for index, (name, value) in enumerate(zip(self.style["names"], values)):
+            if index in section_starts:
+                if index:
+                    lines.append("")
+                lines.append(section_starts[index])
+            short = STYLE_SHORT_NAMES.get(name, name[:20])
+            lines.append(f"{short:<20} {value:>8.4f}")
+        self.style_value_text.set_text("\n".join(lines))
 
     def interval_ms(self):
         return max(
@@ -587,6 +803,7 @@ class CommandPlayer:
 
         try:
             self._render_frame_impl(i)
+            self.update_style_display(i)
             self.fig.canvas.draw_idle()
 
         except Exception:
@@ -1051,6 +1268,22 @@ def main():
         ),
     )
 
+    style_selection = parser.add_mutually_exclusive_group()
+    style_selection.add_argument(
+        "--style",
+        type=Path,
+        default=None,
+        help=(
+            "Style descriptor NPZ. By default, COMMAND.style.npz is loaded "
+            "automatically when present."
+        ),
+    )
+    style_selection.add_argument(
+        "--no-style",
+        action="store_true",
+        help="Disable descriptor auto-discovery and display.",
+    )
+
     parser.add_argument(
         "--no-human",
         action="store_true",
@@ -1103,6 +1336,32 @@ def main():
         f"{metadata.get('interface_name', 'unknown')} "
         f"v{metadata.get('interface_version', 'unknown')}"
     )
+
+    style = None
+    style_indices = None
+    if not args.no_style:
+        style_path = args.style
+        if style_path is None:
+            candidate = command_path.with_name(f"{command_path.stem}.style.npz")
+            if candidate.exists():
+                style_path = candidate
+        if style_path is not None:
+            style_path, style = load_style_descriptor(
+                style_path,
+                fallback_timestamps=cmd["timestamp"],
+            )
+            style_indices = nearest_indices(
+                style["timestamp"],
+                cmd["timestamp"],
+            )
+            print(
+                f"Style  : {style_path}\n"
+                f"         {style['descriptor'].shape[1]}D, "
+                f"{len(style['descriptor'])} frames, "
+                f"v{style['metadata'].get('descriptor_version', 'unknown')}"
+            )
+        elif args.style is None:
+            print("Style  : no auto-discovered sidecar")
 
     human_body = None
     human_indices = None
@@ -1206,6 +1465,8 @@ def main():
         human_body=human_body,
         human_indices=human_indices,
         verification=verification,
+        style=style,
+        style_indices=style_indices,
         fps=args.fps,
         start_frame=args.start_frame,
         trail_frames=args.trail_frames,
