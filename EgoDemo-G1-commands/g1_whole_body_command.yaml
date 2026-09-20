@@ -1,7 +1,7 @@
 # Unitree G1 sparse whole-body command
 interface:
   name: g1_sparse_whole_body_command
-  version: "3.1"
+  version: "3.2"
 
 coordinate_system:
   frame_id: g1_command_world

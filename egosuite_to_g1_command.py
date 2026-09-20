@@ -26,7 +26,7 @@ LEFT_WRIST = 20
 RIGHT_WRIST = 21
 
 G1_HEIGHT_M = 1.320
-G1_WRIST_SPAN_M = 0.85219
+G1_WRIST_SPAN_M = 1.02
 
 CONTROL_INTERFACE_VERSION = "3.2"
 
@@ -283,7 +283,7 @@ def retarget_positions(positions, scale, origin_xy, ground_z):
 def extract_g1_command(
     data,
     *,
-    scale_mode="conservative",
+    scale_mode="height",
     robot_height=G1_HEIGHT_M,
     robot_wrist_span=G1_WRIST_SPAN_M,
     explicit_scale=None,
@@ -326,12 +326,14 @@ def extract_g1_command(
         limiting_factor = "explicit"
     elif scale_mode == "conservative":
         scale = min(height_scale, wrist_span_scale)
+        scale = np.clip(scale, 0.72, 0.80)
         scale_description = "min(height, wrist_span)"
         limiting_factor = (
             "height" if height_scale <= wrist_span_scale else "wrist_span"
         )
     elif scale_mode == "height":
         scale = height_scale
+        scale = np.clip(scale, 0.72, 0.80)
         scale_description = "height"
         limiting_factor = "height"
     elif scale_mode == "wrist_span":
